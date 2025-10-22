@@ -6,6 +6,8 @@ import requests
 import traceback
 import logging
 import base64
+import re
+import uuid
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
@@ -229,6 +231,63 @@ conversation_memory = {}
 tone_preferences = {}  # maps user_id -> "professional" | "casual"
 pending_tone_requests = set()  # phone numbers awaiting tone reply
 
+# --- NEW: explicit per-user session state machine ---
+# states: NEW (default), GREETED, AWAITING_PROBLEM, AWAITING_TONE, IN_CONVERSATION
+user_sessions = {}  # maps user_id -> {"state": "NEW", "last_activity": datetime, "session_id": str}
+
+from datetime import datetime
+
+def _now():
+    return datetime.utcnow()
+
+
+def get_session(user_id):
+    s = user_sessions.get(user_id)
+    if not s:
+        s = {"state": "NEW", "last_activity": _now(), "session_id": str(uuid.uuid4())}
+        user_sessions[user_id] = s
+    else:
+        s["last_activity"] = _now()
+    return s
+
+
+def set_state(user_id, state):
+    s = get_session(user_id)
+    s["state"] = state
+    s["last_activity"] = _now()
+
+# Deterministic helpers for greetings and problem detection
+
+def should_react_with_heart(user_input: str) -> bool:
+    if not user_input:
+        return False
+    text = user_input.strip().lower()
+    # treat very short greetings only
+    return bool(re.match(r'^(hi|hello|hey|hiya|good morning|good afternoon|good evening)([!.]|\s|$)', text))
+
+
+def is_problem_statement(user_input: str) -> bool:
+    if not user_input:
+        return False
+    text = user_input.strip().lower()
+    problem_triggers = ["problem", "issue", "help", "error", "can't", "cannot", "unable", "stuck", "not working", "fail", "failure", "bug", "having trouble", "need help"]
+    if any(t in text for t in problem_triggers):
+        return True
+    if "?" in text or len(text.split()) >= 6:
+        return True
+    return False
+
+
+def _is_workplace_in_scope(user_input: str) -> bool:
+    if not user_input:
+        return False
+    text = user_input.lower()
+    workplace_keywords = {"work", "office", "boss", "manager", "team", "project", "deadline", "salary", "hr", "interview", "promotion", "role", "job", "onboarding", "feedback", "performance", "meeting", "policy", "training", "conflict", "resignation", "termination", "remote", "hybrid"}
+    if any(k in text for k in workplace_keywords):
+        return True
+    return is_problem_statement(user_input)
+
+
 def generate_reply_for_input(user_id: str, user_input: str) -> str:
     tone = tone_preferences.get(user_id)
     effective_input = user_input
@@ -269,8 +328,6 @@ def _basic_auth_header(auth: tuple):
     token = base64.b64encode(f"{user}:{passwd}".encode()).decode()
     return {"Authorization": f"Basic {token}"}
 
-# ... download_media, convert_to_mp3, transcribe_with_openai unchanged ...
-# For brevity in this canvas we include them unchanged from prior version
 
 def download_media(url: str, dest_path: str, auth: tuple = None, timeout: int = 30):
     logger.debug("download_media called for %s (auth=%s)", url, bool(auth))
@@ -366,6 +423,7 @@ def transcribe_with_openai(audio_file_path: str) -> str:
         return ""
 
 # --- Meta WhatsApp helpers ---
+
 def send_whatsapp_reaction(to_number: str, message_id: str, emoji: str, phone_number_id: str, access_token: str):
     url = f"https://graph.facebook.com/v17.0/{phone_number_id}/messages"
     payload = {
@@ -378,24 +436,6 @@ def send_whatsapp_reaction(to_number: str, message_id: str, emoji: str, phone_nu
     headers = {"Authorization": f"Bearer {access_token}"}
     resp = requests.post(url, json=payload, headers=headers)
     resp.raise_for_status()
-
-
-def should_react_with_heart(user_input: str) -> bool:
-    triggers = ["hi", "hello", "hey", "my name is"]
-    return any(trigger in user_input.lower() for trigger in triggers)
-
-
-def is_problem_statement(user_input: str) -> bool:
-    if not user_input:
-        return False
-    text = user_input.lower()
-    problem_triggers = ["problem", "issue", "help", "error", "can't", "cannot", "unable", "stuck", "not working", "fail", "failure", "bug", "having trouble"]
-    if any(t in text for t in problem_triggers):
-        return True
-    # If user writes a reasonably long descriptive message or asks a question, treat as problem
-    if len(text.split()) > 6 or "?" in text:
-        return True
-    return False
 
 
 def send_meta_text(to_number: str, text: str):
@@ -460,7 +500,6 @@ def whatsapp_webhook():
 
         user_input = None
         if num_media > 0:
-            # media handling (unchanged)
             media_url = request.form.get("MediaUrl0")
             media_ct = request.form.get("MediaContentType0", "")
             try:
@@ -490,29 +529,62 @@ def whatsapp_webhook():
             resp.message("👋 I didn’t receive any text. Please send a message.")
             return str(resp), 200
 
-        # If the user just sent a greeting (e.g., hi/hello) and it's not a problem statement, exchange greetings and ask how to help
-        if should_react_with_heart(user_input) and not is_problem_statement(user_input):
+        # ensure session exists
+        session = get_session(from_number)
+        state = session.get("state", "NEW")
+
+        # handle greeting deterministically
+        if should_react_with_heart(user_input) and state == "NEW":
             resp = MessagingResponse()
             try:
-                resp.message("❤️ Hi! 👋 How can I help you today?")
+                resp.message("❤️ Hi! 👋 What work-related problem are you facing right now?")
+                set_state(from_number, "AWAITING_PROBLEM")
             except Exception:
                 logger.exception("Error sending Twilio greeting follow-up")
             return str(resp), 200
 
-        # If user was previously prompted for tone using Twilio, accept direct replies
-        lower = user_input.lower().strip()
-        if from_number in pending_tone_requests and lower in ("professional", "casual"):
-            tone_preferences[from_number] = lower
-            pending_tone_requests.discard(from_number)
+        # If we asked for a problem and user replies with something short/non-problem, re-prompt once
+        if state == "AWAITING_PROBLEM" and not is_problem_statement(user_input):
             resp = MessagingResponse()
-            resp.message(f"Got it — I'll reply in a {lower.capitalize()} tone. How can I help today?")
+            resp.message("Thanks — could you briefly describe the work-related problem you'd like help with? (one or two sentences)")
             return str(resp), 200
 
-        # If message looks like a problem and we haven't asked tone yet, prompt for tone (Twilio fallback)
-        if is_problem_statement(user_input) and from_number not in tone_preferences and from_number not in pending_tone_requests:
+        # If user provided a problem and we don't yet have tone preference, ask for tone
+        if (state in ("AWAITING_PROBLEM", "GREETED") or is_problem_statement(user_input)) and from_number not in tone_preferences:
+            conv = conversation_memory.get(from_number, [])
+            conv += [{"role": "user", "content": user_input}]
+            conversation_memory[from_number] = conv[-20:]
             pending_tone_requests.add(from_number)
+            set_state(from_number, "AWAITING_TONE")
             resp = MessagingResponse()
             resp.message("Would you like replies in a Professional or Casual tone? Reply 'Professional' or 'Casual'.")
+            return str(resp), 200
+
+        # If user answers tone in free text
+        lower = user_input.lower().strip()
+        if state == "AWAITING_TONE" and lower in ("professional", "casual"):
+            tone_preferences[from_number] = lower
+            pending_tone_requests.discard(from_number)
+            set_state(from_number, "IN_CONVERSATION")
+            resp = MessagingResponse()
+            resp.message(f"Got it — I'll reply in a {lower.capitalize()} tone. Tell me more about the problem or ask your first question.")
+            return str(resp), 200
+
+        # If we are awaiting tone but user replied something else (not a tone), politely remind
+        if state == "AWAITING_TONE" and lower not in ("professional", "casual"):
+            resp = MessagingResponse()
+            resp.message("Please reply 'Professional' or 'Casual' so I know how to phrase my responses.")
+            return str(resp), 200
+
+        # At this point we should be in IN_CONVERSATION (or tone already set). Enforce workplace-only guard:
+        current_state = get_session(from_number).get("state")
+        if current_state != "IN_CONVERSATION" and from_number in tone_preferences:
+            set_state(from_number, "IN_CONVERSATION")
+
+        # Workplace guard: only allow work-related queries. If off-topic, decline politely.
+        if not _is_workplace_in_scope(user_input):
+            resp = MessagingResponse()
+            resp.message("I’m here to help with workplace-related issues only. If you have a work problem, please describe it and I’ll help. Otherwise I’m not able to assist with that topic.")
             return str(resp), 200
 
         # Otherwise generate reply normally
@@ -574,7 +646,8 @@ def meta_webhook():
                                     logger.exception("Error sending reaction on greeting")
                                 # Also send a friendly follow-up question to invite the user to describe their problem
                                 try:
-                                    send_meta_text(from_number, "Hi! 👋 How can I help you today?")
+                                    send_meta_text(from_number, "Hi! 👋 What work-related problem are you facing right now?")
+                                    set_state(from_number, "AWAITING_PROBLEM")
                                 except Exception:
                                     logger.exception("Error sending greeting follow-up")
                                 # Do not send interactive tone choice on simple greeting — wait for a problem statement
@@ -650,28 +723,53 @@ def meta_webhook():
                             except Exception:
                                 logger.exception("Error sending reaction for user_input")
 
-                            # If this message contains a problem and we don't yet have a tone set, prompt with interactive template
-                            if is_problem_statement(user_input) and from_number not in tone_preferences:
+                            session = get_session(from_number)
+                            state = session.get("state", "NEW")
+                            lower = user_input.lower().strip()
+
+                            # greeting -> ask problem
+                            if should_react_with_heart(user_input) and state == "NEW":
+                                try:
+                                    send_meta_text(from_number, "Hi! 👋 What work-related problem are you facing right now?")
+                                    set_state(from_number, "AWAITING_PROBLEM")
+                                except Exception:
+                                    logger.exception("Error sending meta greeting follow-up")
+                                continue
+
+                            if state == "AWAITING_PROBLEM" and not is_problem_statement(user_input):
+                                send_meta_text(from_number, "Could you briefly describe the work-related problem you'd like help with? (one or two sentences)")
+                                continue
+
+                            # problem received -> ask tone if not set
+                            if (state in ("AWAITING_PROBLEM", "GREETED") or is_problem_statement(user_input)) and from_number not in tone_preferences:
+                                conv = conversation_memory.get(from_number, [])
+                                conv += [{"role": "user", "content": user_input}]
+                                conversation_memory[from_number] = conv[-20:]
+                                set_state(from_number, "AWAITING_TONE")
                                 try:
                                     send_meta_interactive_tone_choice(from_number)
                                 except Exception:
                                     logger.exception("Error sending interactive tone choice on problem")
-                                # we prompt for tone first; the user will select via button reply
                                 continue
 
+                            # if awaiting tone but user replied free-text
+                            if state == "AWAITING_TONE" and lower in ("professional", "casual"):
+                                tone_preferences[from_number] = lower
+                                set_state(from_number, "IN_CONVERSATION")
+                                send_meta_text(from_number, f"Got it — I'll reply in a {lower.capitalize()} tone. Tell me more about the problem or ask your first question.")
+                                continue
+                            if state == "AWAITING_TONE" and lower not in ("professional", "casual"):
+                                send_meta_text(from_number, "Please choose Professional or Casual so I know how to phrase my responses.")
+                                continue
+
+                            # workplace guard
+                            if not _is_workplace_in_scope(user_input):
+                                send_meta_text(from_number, "I’m here to help with workplace-related issues only. If you have a work problem, please describe it and I’ll help.")
+                                continue
+
+                            # generate reply
                             reply_text = generate_reply_for_input(from_number, user_input)
-                            send_url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
-                            payload = {
-                                "messaging_product": "whatsapp",
-                                "to": from_number,
-                                "text": {"body": reply_text},
-                            }
-                            headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
-                            try:
-                                resp = requests.post(send_url, json=payload, headers=headers)
-                                logger.debug("Meta reply sent: %s -- %s", resp.status_code, resp.text)
-                            except Exception:
-                                logger.exception("Error sending Meta reply")
+                            send_meta_text(from_number, reply_text)
 
         return jsonify({"status": "ok"}), 200
     except Exception as e:
