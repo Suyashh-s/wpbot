@@ -6,8 +6,6 @@ import requests
 import traceback
 import logging
 import base64
-import re
-import uuid
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
@@ -62,60 +60,24 @@ except Exception as e:
     openai_client = None
 
 # --- RAG pipeline setup (langchain + vectorstore) ---
-# We will attempt to import optional langchain pieces but tolerate their absence.
-embeddings = None
-db = None
-db_retriever = None
-USING_LANGCHAIN = False
-USING_PROMPTTEMPLATE = False
-LCPromptTemplate = None
-
 try:
-    # Try to import vectorstore and related pieces if available
-    # (these may fail on hosts where langchain or FAISS aren't installed)
-    from langchain_community.vectorstores import FAISS  # type: ignore
-    from langchain_google_genai import GoogleGenerativeAIEmbeddings  # type: ignore
-    # PromptTemplate may live in langchain_core.prompts (new split) or langchain.prompts (older)
-    try:
-        from langchain_core.prompts import PromptTemplate as LCPromptTemplate  # type: ignore
-        USING_PROMPTTEMPLATE = True
-    except Exception:
-        try:
-            from langchain.prompts import PromptTemplate as LCPromptTemplate  # type: ignore
-            USING_PROMPTTEMPLATE = True
-        except Exception:
-            LCPromptTemplate = None
-            USING_PROMPTTEMPLATE = False
+    from langchain_community.vectorstores import FAISS
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+    from langchain.prompts import PromptTemplate
+    from langchain_openai import ChatOpenAI
+    from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+    from langchain.chains.combine_documents import create_stuff_documents_chain
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-    # Attempt to import chain/llm bits (may also fail)
-    try:
-        from langchain_openai import ChatOpenAI  # type: ignore
-        from langchain.chains import create_history_aware_retriever, create_retrieval_chain  # type: ignore
-        from langchain.chains.combine_documents import create_stuff_documents_chain  # type: ignore
-        from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder  # type: ignore
-        # initialize embeddings + FAISS only if all above imports succeeded
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        db = FAISS.load_local("my_vector_store", embeddings, allow_dangerous_deserialization=True)
-        db_retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-        USING_LANGCHAIN = True
-        logger.info("Vector store loaded and langchain pieces available")
-    except Exception as e_inner:
-        # If any of these pieces are missing, log and continue with fallbacks
-        logger.warning("LangChain LLM/chain components not available: %s", e_inner)
-        embeddings = None
-        db = None
-        db_retriever = None
-        USING_LANGCHAIN = False
-
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    db = FAISS.load_local("my_vector_store", embeddings, allow_dangerous_deserialization=True)
+    db_retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+    logger.info("Vector store loaded")
 except Exception as e:
-    # top-level langchain imports failed (common on lightweight hosts). Continue without RAG.
-    logger.warning("LangChain/vectorstore imports failed or not installed: %s", e)
+    logger.exception("Error initializing vector store or langchain modules: %s", e)
     embeddings = None
     db = None
     db_retriever = None
-    USING_LANGCHAIN = False
-    USING_PROMPTTEMPLATE = False
-    LCPromptTemplate = None
 
 # Prompt template (keep full prompt text as needed)
 prompt_template = """
@@ -172,6 +134,30 @@ Step 4. Keep It Grounded
 
 ⸻
 
+📌 Case Scenarios (for illustration only)
+
+Scenario A – Adaptability (STEP)
+User: “My manager keeps changing deadlines and I feel frustrated.”
+Chatbot: “What feels hardest for you — the constant changes, or how you’re reacting to them?”
+User: “It’s really about the constant changes.”
+Chatbot: “Let’s try a framework that can help you with flexibility in situations like this…” [guides with Spot–Think–Engage–Perform].
+
+⸻
+
+Scenario B – Emotional Intelligence (4Rs)
+User: “I feel ignored when my teammate doesn’t listen to my ideas.”
+Chatbot: “What feels more challenging here — adjusting to their style, or how you feel in that moment?”
+User: “It’s definitely how I feel.”
+Chatbot: “Alright, let’s use a framework that can help with how you handle emotions in these situations…” [guides with Recognize–Regulate–Respect–Reflect].
+
+⸻
+
+Scenario C – Mid-Conversation Switch
+User: “I feel anxious when projects keep changing direction.”
+Chatbot: “Is the tougher part adapting to the changes, or the feelings that come with them?”
+User: “Actually, it’s the anxiety.”
+Chatbot: “Thanks for sharing that — in this case, let’s try a framework that focuses more on managing emotions…” [switches from STEP to 4Rs].
+
 Critical Communication Rules
 Keep It Short and Natural
 Maximum 2 sentences per response (3 only if absolutely necessary)
@@ -187,6 +173,26 @@ Good Examples (Concise, Natural):
 ✅ "I get why you're frustrated. Sounds like your manager's style is really different from what you're used to."
 ✅ "That's a tough spot to be in. Would it help to work through a method for handling situations like this?"
 ✅ "It's called the 4Rs framework. You've already done RECOGNIZE - you know this pattern triggers stress. Now REGULATE - when they hand you work at 5pm, what could help you stay calm?"
+User: "my boss keeps giving me work right when i'm about to leave"
+AI: "That's super frustrating. Does this happen a lot?"
+AI: "Sounds like a pattern. What's the main issue for you - the extra work or the timing?"
+AI: "That uncertainty would stress anyone out. I can't help change your boss's timing, but I can help you manage the stress this creates. Want to try that?"
+AI: "It's called the 4Rs framework. You've already done RECOGNIZE - you know this pattern triggers stress. Now REGULATE - when they hand you work at 5pm, what could help you stay calm?"
+AI: "maybe just accept it's going to happen?"
+AI: "Right, expecting it instead of being surprised. Now RESPECT - why might your boss do this?"
+AI: "probably they're disorganized or have stuff come up last minute"
+AI: "Probably not personal to you. REFLECT - what boundary could you test, like 'I can start on this tomorrow morning'?"
+AI: "i could try that"
+AI: "You've used the full 4Rs approach. Use it anytime you're managing difficult work situations."
+Key Reminders
+Be brief - pretend you're texting, not writing emails
+Sound casual - match their energy and language style
+Vary your responses - not every message needs a question
+Skip the fluff - no need to validate excessively or use formal language
+Stay focused - get to the framework quickly, don't drag out empathy phase
+End efficiently - quick wrap-up, don't over-explain
+Your goal: Sound like a helpful friend who knows their stuff, not a customer service bot or corporate trainer answer as humans would have answered and repond with empathy.
+
 CONTEXT: {context}
 CHAT_HISTORY: {chat_history}
 QUESTION: {question}
@@ -194,235 +200,65 @@ ANSWER:
 </s>[INST]
 """
 
-# Create a PromptTemplate object only if LCPromptTemplate is available
-prompt = None
-if LCPromptTemplate is not None:
-    try:
-        # Use from_template if available (compatible with new/old langchain)
-        if hasattr(LCPromptTemplate, "from_template"):
-            try:
-                prompt = LCPromptTemplate.from_template(prompt_template)
-            except Exception:
-                # Fallback constructor
-                prompt = LCPromptTemplate(template=prompt_template, input_variables=["context", "question", "chat_history"])
-        else:
-            prompt = LCPromptTemplate(template=prompt_template, input_variables=["context", "question", "chat_history"])
-        logger.info("PromptTemplate initialized via langchain package")
-    except Exception as e:
-        logger.warning("Failed to initialize PromptTemplate: %s", e)
-        prompt = None
+from langchain.prompts import PromptTemplate as LCPromptTemplate
+prompt = LCPromptTemplate(template=prompt_template, input_variables=["context", "question", "chat_history"])
 
-# LLM + chains (guarded) — if langchain chain pieces are available, set them up, else leave as None
-llm = None
-qa = None
-if USING_LANGCHAIN and db_retriever is not None:
-    try:
-        from langchain_openai import ChatOpenAI  # type: ignore
-        from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder  # type: ignore
-        from langchain.chains import create_history_aware_retriever, create_retrieval_chain  # type: ignore
-        from langchain.chains.combine_documents import create_stuff_documents_chain  # type: ignore
+# LLM + chains (guarded)
+try:
+    llm = ChatOpenAI(api_key=OPENAI_API_KEY, model_name="gpt-4o-mini")
+    contextualize_q_system_prompt = "Given the conversation so far and a follow-up question, rephrase the follow-up question to be a standalone question."
+    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+        [("system", contextualize_q_system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")]
+    )
+    history_aware_retriever = create_history_aware_retriever(llm, db_retriever, contextualize_q_prompt)
 
-        llm = ChatOpenAI(api_key=OPENAI_API_KEY, model_name="gpt-4o-mini")
-        contextualize_q_system_prompt = "Given the conversation so far and a follow-up question, rephrase the follow-up question to be a standalone question."
-        contextualize_q_prompt = ChatPromptTemplate.from_messages(
-            [("system", contextualize_q_system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")]
-        )
-        history_aware_retriever = create_history_aware_retriever(llm, db_retriever, contextualize_q_prompt)
-
-        qa_system_text = prompt_template.replace("{question}", "{input}")
-        qa_chat_prompt = ChatPromptTemplate.from_messages(
-            [("system", qa_system_text), MessagesPlaceholder("chat_history"), ("human", "{input}")]
-        )
-        question_answer_chain = create_stuff_documents_chain(llm, qa_chat_prompt)
-        qa = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-        logger.info("LLM and retrieval chain initialized")
-    except Exception as e:
-        logger.exception("Error initializing LLM or chains: %s", e)
-        llm = None
-        qa = None
-else:
-    logger.info("LangChain chains not initialized — running in OpenAI-only fallback mode")
+    qa_system_text = prompt_template.replace("{question}", "{input}")
+    qa_chat_prompt = ChatPromptTemplate.from_messages(
+        [("system", qa_system_text), MessagesPlaceholder("chat_history"), ("human", "{input}")]
+    )
+    question_answer_chain = create_stuff_documents_chain(llm, qa_chat_prompt)
+    qa = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+    logger.info("LLM and retrieval chain initialized")
+except Exception as e:
+    logger.exception("Error initializing LLM or chains: %s", e)
+    llm = None
+    qa = None
 
 # Conversation memory and tone preferences
 conversation_memory = {}
 tone_preferences = {}  # maps user_id -> "professional" | "casual"
 pending_tone_requests = set()  # phone numbers awaiting tone reply
 
-# --- NEW: explicit per-user session state machine ---
-# states: NEW (default), GREETED, AWAITING_PROBLEM, AWAITING_TONE, IN_CONVERSATION
-user_sessions = {}  # maps user_id -> {"state": "NEW", "last_activity": datetime, "session_id": str}
-
-from datetime import datetime
-
-def _now():
-    return datetime.utcnow()
-
-def get_session(user_id):
-    s = user_sessions.get(user_id)
-    if not s:
-        s = {"state": "NEW", "last_activity": _now(), "session_id": str(uuid.uuid4())}
-        user_sessions[user_id] = s
-    else:
-        s["last_activity"] = _now()
-    return s
-
-def set_state(user_id, state):
-    s = get_session(user_id)
-    s["state"] = state
-    s["last_activity"] = _now()
-
-# Deterministic helpers for greetings and problem detection
-def should_react_with_heart(user_input: str) -> bool:
-    if not user_input:
-        return False
-    text = user_input.strip().lower()
-    # treat very short greetings only
-    return bool(re.match(r'^(hi|hello|hey|hiya|good morning|good afternoon|good evening)([!.]|\s|$)', text))
-
-def is_problem_statement(user_input: str) -> bool:
-    if not user_input:
-        return False
-    text = user_input.strip().lower()
-    problem_triggers = ["problem", "issue", "help", "error", "can't", "cannot", "unable", "stuck", "not working", "fail", "failure", "bug", "having trouble", "need help"]
-    if any(t in text for t in problem_triggers):
-        return True
-    if "?" in text or len(text.split()) >= 6:
-        return True
-    return False
-
-def _is_workplace_in_scope(user_input: str) -> bool:
-    if not user_input:
-        return False
-    text = user_input.lower()
-    workplace_keywords = {"work", "office", "boss", "manager", "team", "project", "deadline", "salary", "hr", "interview", "promotion", "role", "job", "onboarding", "feedback", "performance", "meeting", "policy", "training", "conflict", "resignation", "termination", "remote", "hybrid"}
-    if any(k in text for k in workplace_keywords):
-        return True
-    return is_problem_statement(user_input)
-
-# --- OpenAI-only reply generator (robust fallback) ---
-def _build_system_messages(user_id: str):
-    # include the prompt_template as the system message and a brief chat history
-    chat_history = conversation_memory.get(user_id, [])
-    history_text = ""
-    if chat_history:
-        # include up to last 6 turns (12 entries user+assistant)
-        for turn in chat_history[-12:]:
-            role = turn.get("role", "user")
-            content = turn.get("content", "")
-            history_text += f"\n{role.upper()}: {content}"
-    system_content = prompt_template
-    if history_text:
-        system_content += "\n\nRECENT_CHAT_HISTORY:" + history_text
-    return [{"role": "system", "content": system_content}]
-
 def generate_reply_for_input(user_id: str, user_input: str) -> str:
-    """
-    Minimal, robust OpenAI-only reply generator.
-    Uses the OpenAI Python client wrapper `OpenAI` you've already initialized as openai_client.
-    If a langchain/qa chain is available (qa != None), it will be used instead.
-    """
-    # If a langchain QA chain exists, prefer it (guarded)
-    if qa is not None:
-        try:
-            tone = tone_preferences.get(user_id)
-            effective_input = user_input
-            if tone:
-                effective_input = f"[TONE: {tone}]\n{user_input}"
-            chat_history_for_chain = conversation_memory.get(user_id, [])
-            result = qa.invoke({"input": effective_input, "chat_history": chat_history_for_chain})
-            # result may be dict-like
-            answer = ""
-            if isinstance(result, dict):
-                answer = result.get("answer") or result.get("output_text") or result.get("result") or result.get("output") or ""
-            else:
-                answer = str(result)
-            # store history
-            history = chat_history_for_chain[:] if chat_history_for_chain else []
-            history += [{"role": "user", "content": user_input}, {"role": "assistant", "content": answer}]
-            conversation_memory[user_id] = history[-20:]
-            return answer or "Sorry, I couldn't generate an answer right now."
-        except Exception as e:
-            logger.exception("Error invoking QA chain: %s", e)
-            # fall through to OpenAI-only fallback
-
-    # fallback when OpenAI client missing
-    if not openai_client:
-        return "Sorry, assistant is temporarily unavailable."
-
     tone = tone_preferences.get(user_id)
-    user_text = user_input
+    effective_input = user_input
     if tone:
-        user_text = f"[TONE: {tone}]\n{user_text}"
-
-    messages = _build_system_messages(user_id) + [{"role": "user", "content": user_text}]
-
+        effective_input = f"[TONE: {tone}]\n{user_input}"
+    chat_history_for_chain = conversation_memory.get(user_id, [])
     try:
-        # Prefer responses API when available on the client
-        if hasattr(openai_client, "responses"):
-            combined_input = "\n\n".join([m.get("content", "") for m in messages])
-            resp = openai_client.responses.create(model="gpt-4o-mini", input=combined_input, max_output_tokens=800)
-            # Extract text carefully
-            answer = ""
-            if isinstance(resp, dict):
-                out = resp.get("output") or resp.get("choices", [{}])[0].get("message", {}).get("content")
-                if isinstance(out, list):
-                    parts = []
-                    for item in out:
-                        if isinstance(item, dict):
-                            parts.append(item.get("content", ""))
-                        else:
-                            parts.append(str(item))
-                    answer = "\n".join([p for p in parts if p])
-                else:
-                    answer = out or ""
-            else:
-                out = getattr(resp, "output", None) or getattr(resp, "text", None)
-                if isinstance(out, list):
-                    parts = []
-                    for item in out:
-                        if isinstance(item, dict):
-                            parts.append(item.get("content", ""))
-                        else:
-                            parts.append(str(item))
-                    answer = "\n".join([p for p in parts if p])
-                else:
-                    answer = out or ""
+        if qa:
+            result = qa.invoke({"input": effective_input, "chat_history": chat_history_for_chain})
         else:
-            # fallback to chat completions if responses API not present
-            chat_messages = []
-            for m in messages:
-                chat_messages.append({"role": m.get("role"), "content": m.get("content")})
-            resp = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=chat_messages,
-                max_tokens=800,
-                temperature=0.3,
-            )
-            answer = ""
-            if isinstance(resp, dict):
-                choices = resp.get("choices", [])
-                if choices:
-                    first = choices[0]
-                    answer = first.get("message", {}).get("content") or ""
-            else:
-                choices = getattr(resp, "choices", None)
-                if choices:
-                    first = choices[0]
-                    if isinstance(first, dict):
-                        answer = first.get("message", {}).get("content") or ""
-                    else:
-                        msg = getattr(first, "message", None)
-                        if msg:
-                            answer = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")
+            result = {"answer": "Sorry, the assistant is temporarily unavailable."}
     except Exception as e:
-        logger.exception("OpenAI request failed: %s", e)
-        return "Sorry, something went wrong while processing your request."
+        logger.exception("Error invoking QA chain: %s", e)
+        result = {"answer": "Sorry, something went wrong while processing your request."}
 
-    # store in conversation memory
-    hist = conversation_memory.get(user_id, [])
-    hist += [{"role": "user", "content": user_input}, {"role": "assistant", "content": answer}]
-    conversation_memory[user_id] = hist[-20:]
-    return answer or "Sorry, I couldn't generate an answer right now."
+    answer = (
+        result.get("answer")
+        or result.get("output_text")
+        or result.get("result")
+        or result.get("output")
+        if isinstance(result, dict)
+        else (result if isinstance(result, str) else str(result))
+    )
+
+    history = chat_history_for_chain[:] if chat_history_for_chain else []
+    history += [{"role": "user", "content": user_input}, {"role": "assistant", "content": answer}]
+    if len(history) > 20:
+        history = history[-20:]
+    conversation_memory[user_id] = history
+    return answer
 
 # --- Robust helpers for audio download, conversion, transcription ---
 
@@ -432,6 +268,9 @@ def _basic_auth_header(auth: tuple):
     user, passwd = auth
     token = base64.b64encode(f"{user}:{passwd}".encode()).decode()
     return {"Authorization": f"Basic {token}"}
+
+# ... download_media, convert_to_mp3, transcribe_with_openai unchanged ...
+# For brevity in this canvas we include them unchanged from prior version
 
 def download_media(url: str, dest_path: str, auth: tuple = None, timeout: int = 30):
     logger.debug("download_media called for %s (auth=%s)", url, bool(auth))
@@ -501,9 +340,11 @@ def download_media(url: str, dest_path: str, auth: tuple = None, timeout: int = 
         pass
     raise requests.HTTPError(f"All media fetch strategies failed for {url}")
 
+
 def convert_to_mp3(input_path: str, output_path: str) -> None:
     cmd = ["ffmpeg", "-y", "-i", input_path, "-ar", "16000", "-ac", "1", "-b:a", "128k", output_path]
     subprocess.run(cmd, check=True)
+
 
 def transcribe_with_openai(audio_file_path: str) -> str:
     if not openai_client:
@@ -525,7 +366,6 @@ def transcribe_with_openai(audio_file_path: str) -> str:
         return ""
 
 # --- Meta WhatsApp helpers ---
-
 def send_whatsapp_reaction(to_number: str, message_id: str, emoji: str, phone_number_id: str, access_token: str):
     url = f"https://graph.facebook.com/v17.0/{phone_number_id}/messages"
     payload = {
@@ -539,6 +379,25 @@ def send_whatsapp_reaction(to_number: str, message_id: str, emoji: str, phone_nu
     resp = requests.post(url, json=payload, headers=headers)
     resp.raise_for_status()
 
+
+def should_react_with_heart(user_input: str) -> bool:
+    triggers = ["hi", "hello", "hey", "my name is"]
+    return any(trigger in user_input.lower() for trigger in triggers)
+
+
+def is_problem_statement(user_input: str) -> bool:
+    if not user_input:
+        return False
+    text = user_input.lower()
+    problem_triggers = ["problem", "issue", "help", "error", "can't", "cannot", "unable", "stuck", "not working", "fail", "failure", "bug", "having trouble"]
+    if any(t in text for t in problem_triggers):
+        return True
+    # If user writes a reasonably long descriptive message or asks a question, treat as problem
+    if len(text.split()) > 6 or "?" in text:
+        return True
+    return False
+
+
 def send_meta_text(to_number: str, text: str):
     url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
     payload = {"messaging_product": "whatsapp", "to": to_number, "text": {"body": text}}
@@ -549,6 +408,7 @@ def send_meta_text(to_number: str, text: str):
     except Exception:
         logger.exception("Error sending meta text: %s -- response: %s", resp.text if resp is not None else None)
     return resp
+
 
 def send_meta_interactive_tone_choice(to_number: str):
     url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
@@ -600,6 +460,7 @@ def whatsapp_webhook():
 
         user_input = None
         if num_media > 0:
+            # media handling (unchanged)
             media_url = request.form.get("MediaUrl0")
             media_ct = request.form.get("MediaContentType0", "")
             try:
@@ -629,62 +490,20 @@ def whatsapp_webhook():
             resp.message("👋 I didn’t receive any text. Please send a message.")
             return str(resp), 200
 
-        # ensure session exists
-        session = get_session(from_number)
-        state = session.get("state", "NEW")
-
-        # handle greeting deterministically
-        if should_react_with_heart(user_input) and state == "NEW":
-            resp = MessagingResponse()
-            try:
-                resp.message("❤️ Hi! 👋 What work-related problem are you facing right now?")
-                set_state(from_number, "AWAITING_PROBLEM")
-            except Exception:
-                logger.exception("Error sending Twilio greeting follow-up")
-            return str(resp), 200
-
-        # If we asked for a problem and user replies with something short/non-problem, re-prompt once
-        if state == "AWAITING_PROBLEM" and not is_problem_statement(user_input):
-            resp = MessagingResponse()
-            resp.message("Thanks — could you briefly describe the work-related problem you'd like help with? (one or two sentences)")
-            return str(resp), 200
-
-        # If user provided a problem and we don't yet have tone preference, ask for tone
-        if (state in ("AWAITING_PROBLEM", "GREETED") or is_problem_statement(user_input)) and from_number not in tone_preferences:
-            conv = conversation_memory.get(from_number, [])
-            conv += [{"role": "user", "content": user_input}]
-            conversation_memory[from_number] = conv[-20:]
-            pending_tone_requests.add(from_number)
-            set_state(from_number, "AWAITING_TONE")
-            resp = MessagingResponse()
-            resp.message("Would you like replies in a Professional or Casual tone? Reply 'Professional' or 'Casual'.")
-            return str(resp), 200
-
-        # If user answers tone in free text
+        # If user was previously prompted for tone using Twilio, accept direct replies
         lower = user_input.lower().strip()
-        if state == "AWAITING_TONE" and lower in ("professional", "casual"):
+        if from_number in pending_tone_requests and lower in ("professional", "casual"):
             tone_preferences[from_number] = lower
             pending_tone_requests.discard(from_number)
-            set_state(from_number, "IN_CONVERSATION")
             resp = MessagingResponse()
-            resp.message(f"Got it — I'll reply in a {lower.capitalize()} tone. Tell me more about the problem or ask your first question.")
+            resp.message(f"Got it — I'll reply in a {lower.capitalize()} tone. How can I help today?")
             return str(resp), 200
 
-        # If we are awaiting tone but user replied something else (not a tone), politely remind
-        if state == "AWAITING_TONE" and lower not in ("professional", "casual"):
+        # If message looks like a problem and we haven't asked tone yet, prompt for tone (Twilio fallback)
+        if is_problem_statement(user_input) and from_number not in tone_preferences and from_number not in pending_tone_requests:
+            pending_tone_requests.add(from_number)
             resp = MessagingResponse()
-            resp.message("Please reply 'Professional' or 'Casual' so I know how to phrase my responses.")
-            return str(resp), 200
-
-        # At this point we should be in IN_CONVERSATION (or tone already set). Enforce workplace-only guard:
-        current_state = get_session(from_number).get("state")
-        if current_state != "IN_CONVERSATION" and from_number in tone_preferences:
-            set_state(from_number, "IN_CONVERSATION")
-
-        # Workplace guard: only allow work-related queries. If off-topic, decline politely.
-        if not _is_workplace_in_scope(user_input):
-            resp = MessagingResponse()
-            resp.message("I’m here to help with workplace-related issues only. If you have a work problem, please describe it and I’ll help. Otherwise I’m not able to assist with that topic.")
+            resp.message("Would you like replies in a Professional or Casual tone? Reply 'Professional' or 'Casual'.")
             return str(resp), 200
 
         # Otherwise generate reply normally
@@ -744,12 +563,6 @@ def meta_webhook():
                                         send_meta_text(from_number, "❤️")
                                 except Exception:
                                     logger.exception("Error sending reaction on greeting")
-                                # Also send a friendly follow-up question to invite the user to describe their problem
-                                try:
-                                    send_meta_text(from_number, "Hi! 👋 What work-related problem are you facing right now?")
-                                    set_state(from_number, "AWAITING_PROBLEM")
-                                except Exception:
-                                    logger.exception("Error sending greeting follow-up")
                                 # Do not send interactive tone choice on simple greeting — wait for a problem statement
                                 continue
 
@@ -823,53 +636,28 @@ def meta_webhook():
                             except Exception:
                                 logger.exception("Error sending reaction for user_input")
 
-                            session = get_session(from_number)
-                            state = session.get("state", "NEW")
-                            lower = user_input.lower().strip()
-
-                            # greeting -> ask problem
-                            if should_react_with_heart(user_input) and state == "NEW":
-                                try:
-                                    send_meta_text(from_number, "Hi! 👋 What work-related problem are you facing right now?")
-                                    set_state(from_number, "AWAITING_PROBLEM")
-                                except Exception:
-                                    logger.exception("Error sending meta greeting follow-up")
-                                continue
-
-                            if state == "AWAITING_PROBLEM" and not is_problem_statement(user_input):
-                                send_meta_text(from_number, "Could you briefly describe the work-related problem you'd like help with? (one or two sentences)")
-                                continue
-
-                            # problem received -> ask tone if not set
-                            if (state in ("AWAITING_PROBLEM", "GREETED") or is_problem_statement(user_input)) and from_number not in tone_preferences:
-                                conv = conversation_memory.get(from_number, [])
-                                conv += [{"role": "user", "content": user_input}]
-                                conversation_memory[from_number] = conv[-20:]
-                                set_state(from_number, "AWAITING_TONE")
+                            # If this message contains a problem and we don't yet have a tone set, prompt with interactive template
+                            if is_problem_statement(user_input) and from_number not in tone_preferences:
                                 try:
                                     send_meta_interactive_tone_choice(from_number)
                                 except Exception:
                                     logger.exception("Error sending interactive tone choice on problem")
+                                # we prompt for tone first; the user will select via button reply
                                 continue
 
-                            # if awaiting tone but user replied free-text
-                            if state == "AWAITING_TONE" and lower in ("professional", "casual"):
-                                tone_preferences[from_number] = lower
-                                set_state(from_number, "IN_CONVERSATION")
-                                send_meta_text(from_number, f"Got it — I'll reply in a {lower.capitalize()} tone. Tell me more about the problem or ask your first question.")
-                                continue
-                            if state == "AWAITING_TONE" and lower not in ("professional", "casual"):
-                                send_meta_text(from_number, "Please choose Professional or Casual so I know how to phrase my responses.")
-                                continue
-
-                            # workplace guard
-                            if not _is_workplace_in_scope(user_input):
-                                send_meta_text(from_number, "I’m here to help with workplace-related issues only. If you have a work problem, please describe it and I’ll help.")
-                                continue
-
-                            # generate reply
                             reply_text = generate_reply_for_input(from_number, user_input)
-                            send_meta_text(from_number, reply_text)
+                            send_url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
+                            payload = {
+                                "messaging_product": "whatsapp",
+                                "to": from_number,
+                                "text": {"body": reply_text},
+                            }
+                            headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+                            try:
+                                resp = requests.post(send_url, json=payload, headers=headers)
+                                logger.debug("Meta reply sent: %s -- %s", resp.status_code, resp.text)
+                            except Exception:
+                                logger.exception("Error sending Meta reply")
 
         return jsonify({"status": "ok"}), 200
     except Exception as e:
