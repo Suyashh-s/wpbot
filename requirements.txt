@@ -16,6 +16,7 @@ langchain-groq
 PyPDF2
 langchain_google_genai
 langchain
+langchain-core
 langchain-openai
 langchain_community
 python-dotenv
