@@ -122,7 +122,7 @@ try:
     except Exception:
         try:
             # fallback to older or alternate locations
-            from langchain_retrievals.chains import create_history_aware_retriever, create_retrieval_chain
+            from langchain_community.chains import create_history_aware_retriever, create_retrieval_chain
             from langchain.chains.combine_documents import create_stuff_documents_chain
             logger.info("Imported chain helpers from fallback locations")
         except Exception:
