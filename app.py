@@ -74,30 +74,101 @@ embeddings = None
 db = None
 db_retriever = None
 
+# Guarded, granular imports so missing packages won't crash the app at startup
 try:
-    # guarded imports (support both langchain_core and older/langchain locations)
+    # Chat prompt template (try multiple possible import paths)
     try:
         from langchain_core.prompts import ChatPromptTemplate as ChatPromptTemplateImpl, MessagesPlaceholder as MessagesPlaceholderImpl
+        logger.info("Imported ChatPromptTemplate from langchain_core.prompts")
     except Exception:
         try:
             from langchain.prompts.chat import ChatPromptTemplate as ChatPromptTemplateImpl, MessagesPlaceholder as MessagesPlaceholderImpl
+            logger.info("Imported ChatPromptTemplate from langchain.prompts.chat")
         except Exception:
             ChatPromptTemplateImpl = None
             MessagesPlaceholderImpl = None
+            logger.debug("ChatPromptTemplate not available (optional)")
 
-    # other optional integrations (may require separate pip packages)
-    from langchain_community.vectorstores import FAISS
-    from langchain_google_genai import GoogleGenerativeAIEmbeddings
-    from langchain_openai import ChatOpenAI
-    from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-    from langchain.chains.combine_documents import create_stuff_documents_chain
+    # vectorstore and embeddings (optional)
+    try:
+        from langchain_community.vectorstores import FAISS
+        logger.info("Imported FAISS vectorstore")
+    except Exception:
+        FAISS = None
+        logger.debug("FAISS not available (optional)")
 
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    db = FAISS.load_local("my_vector_store", embeddings, allow_dangerous_deserialization=True)
-    db_retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-    logger.info("Vector store loaded")
+    try:
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+        logger.info("Imported GoogleGenerativeAIEmbeddings")
+    except Exception:
+        GoogleGenerativeAIEmbeddings = None
+        logger.debug("GoogleGenerativeAIEmbeddings not available (optional)")
+
+    # langchain Chat LLM wrapper (optional)
+    try:
+        from langchain_openai import ChatOpenAI
+        ChatOpenAI = ChatOpenAI
+        logger.info("Imported langchain_openai.ChatOpenAI")
+    except Exception:
+        ChatOpenAI = None
+        logger.debug("langchain_openai.ChatOpenAI not available (optional)")
+
+    # chains helpers (optional) - try multiple paths and fallback to None
+    try:
+        # newer langchain organization may expose these in different modules
+        from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+        from langchain.chains.combine_documents import create_stuff_documents_chain
+        logger.info("Imported chain helpers from langchain.chains")
+    except Exception:
+        try:
+            # fallback to older or alternate locations
+            from langchain_retrievals.chains import create_history_aware_retriever, create_retrieval_chain
+            from langchain.chains.combine_documents import create_stuff_documents_chain
+            logger.info("Imported chain helpers from fallback locations")
+        except Exception:
+            create_history_aware_retriever = None
+            create_retrieval_chain = None
+            create_stuff_documents_chain = None
+            logger.debug("Chain helpers not available (optional)")
+
+    # Attempt to initialize embeddings + FAISS only if both pieces are present
+    if GoogleGenerativeAIEmbeddings and FAISS:
+        try:
+            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+            # only attempt to load vector store if path exists to avoid noisy exceptions
+            vs_path = "my_vector_store"
+            if os.path.isdir(vs_path):
+                try:
+                    db = FAISS.load_local(vs_path, embeddings, allow_dangerous_deserialization=True)
+                    db_retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+                    logger.info("Vector store loaded from %s", vs_path)
+                except Exception as e:
+                    logger.exception("Failed to load local vector store at %s: %s", vs_path, e)
+                    db = None
+                    db_retriever = None
+            else:
+                logger.info("Vector store path %s not found; skipping load", vs_path)
+                db = None
+                db_retriever = None
+        except Exception as e:
+            logger.exception("Error initializing embeddings or vector store: %s", e)
+            embeddings = None
+            db = None
+            db_retriever = None
+    else:
+        logger.info("Skipping embeddings/FAISS initialization (missing optional dependencies)")
+
 except Exception as e:
+    # Catch-all safeguard: never let optional langchain failures crash the app
     logger.exception("Error initializing vector store or langchain modules: %s", e)
+    ChatPromptTemplateImpl = None
+    MessagesPlaceholderImpl = None
+    FAISS = None
+    GoogleGenerativeAIEmbeddings = None
+    ChatOpenAI = None
+    create_history_aware_retriever = None
+    create_retrieval_chain = None
+    create_stuff_documents_chain = None
     embeddings = None
     db = None
     db_retriever = None
@@ -282,20 +353,32 @@ try:
     if ChatOpenAI is None:
         try:
             from langchain_openai import ChatOpenAI
+            ChatOpenAI = ChatOpenAI
         except Exception:
             ChatOpenAI = None
 
     llm = None
     if ChatOpenAI is not None:
-        llm = ChatOpenAI(api_key=OPENAI_API_KEY, model_name="gpt-4o-mini")
+        try:
+            # Create a lightweight wrapper instance if possible
+            llm = ChatOpenAI(api_key=OPENAI_API_KEY, model_name="gpt-4o-mini")
+            logger.info("Langchain ChatOpenAI initialized")
+        except Exception as e:
+            logger.exception("Failed to initialize ChatOpenAI: %s", e)
+            llm = None
     else:
         llm = None
 
     if llm and db_retriever and create_history_aware_retriever and create_retrieval_chain and create_stuff_documents_chain:
-        history_aware_retriever = create_history_aware_retriever(llm, db_retriever, contextualize_q_prompt)
-        question_answer_chain = create_stuff_documents_chain(llm, qa_chat_prompt)
-        qa = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-        logger.info("LLM and retrieval chain initialized")
+        try:
+            history_aware_retriever = create_history_aware_retriever(llm, db_retriever, contextualize_q_prompt)
+            question_answer_chain = create_stuff_documents_chain(llm, qa_chat_prompt)
+            qa = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+            logger.info("LLM and retrieval chain initialized")
+        except Exception as e:
+            logger.exception("Failed to wire up retrieval chain: %s", e)
+            qa = None
+            history_aware_retriever = None
     else:
         qa = None
         history_aware_retriever = None
@@ -611,7 +694,12 @@ def send_meta_interactive_tone_choice(to_number: str):
 # --- Flask app ---
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
-validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
+validator = None
+try:
+    validator = RequestValidator(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else None
+except Exception:
+    validator = None
+    logger.debug("Twilio RequestValidator not available or failed to initialize")
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -623,9 +711,12 @@ def whatsapp_webhook():
     try:
         if validator and TWILIO_VALIDATE:
             signature = request.headers.get("X-Twilio-Signature", "")
-            if not validator.validate(request.url, request.form, signature):
-                logger.warning("Invalid Twilio signature")
-                return ("Invalid signature", 403)
+            try:
+                if not validator.validate(request.url, request.form, signature):
+                    logger.warning("Invalid Twilio signature")
+                    return ("Invalid signature", 403)
+            except Exception:
+                logger.exception("Twilio signature validation failed; continuing (validator threw)")
 
         from_number = request.form.get("From", "anonymous")
         incoming_msg = (request.form.get("Body") or "").strip()
