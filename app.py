@@ -889,7 +889,15 @@ def meta_webhook():
                             user_input = msg["text"]["body"].strip()
                             logger.debug(f"Text message received: '{user_input}' (length: {len(user_input)})")
                             # Normalize greetings for consistent handling across iOS/Android
-                            if user_input.lower().strip() in ("hi", "hello", "hey", "hi!", "hello!", "hey!"):
+                            # Check if it's a greeting (hi, hello, hey with variations)
+                            normalized_input = user_input.lower().strip().rstrip('!?.,;: ')
+                            is_greeting = (
+                                normalized_input in ("hi", "hello", "hey", "sup", "yo", "hii", "hiii", "hiiii", "helloo", "hellooo", "heyy", "heyyy") or
+                                (normalized_input.startswith("hi") and len(normalized_input) <= 6 and all(c in "hi!" for c in normalized_input)) or
+                                (normalized_input.startswith("hey") and len(normalized_input) <= 7 and all(c in "hey!" for c in normalized_input))
+                            )
+                            if is_greeting:
+                                logger.info(f"Greeting detected: '{user_input}' -> sending tone choice buttons")
                                 try:
                                     if message_id:
                                         send_whatsapp_reaction(
@@ -899,6 +907,7 @@ def meta_webhook():
                                     logger.exception("Error sending reaction on greeting")
                                 try:
                                     send_meta_interactive_tone_choice(from_number)
+                                    logger.info("Tone choice buttons sent successfully")
                                 except Exception:
                                     logger.exception("Error sending interactive tone choice")
                                 # Skip AI response - buttons are enough for greeting
