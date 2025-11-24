@@ -46,6 +46,41 @@ logger.info("TWILIO_ACCOUNT_SID present: %s", bool(TWILIO_ACCOUNT_SID))
 logger.info("TWILIO_AUTH_TOKEN present: %s", bool(TWILIO_AUTH_TOKEN))
 logger.info("TWILIO_AUTH_TOKEN length: %s", len(TWILIO_AUTH_TOKEN or ""))
 
+# --- Phone Number Authorization ---
+ALLOWED_USERS_FILE = "allowed_users.txt"
+allowed_phone_numbers = set()
+
+def load_allowed_users():
+    """Load allowed phone numbers from file."""
+    global allowed_phone_numbers
+    try:
+        if os.path.exists(ALLOWED_USERS_FILE):
+            with open(ALLOWED_USERS_FILE, 'r') as f:
+                allowed_phone_numbers = set(
+                    line.strip() for line in f 
+                    if line.strip() and not line.strip().startswith('#')
+                )
+            logger.info(f"Loaded {len(allowed_phone_numbers)} allowed phone numbers")
+        else:
+            logger.warning(f"Allowed users file not found: {ALLOWED_USERS_FILE}")
+            allowed_phone_numbers = set()
+    except Exception as e:
+        logger.exception(f"Error loading allowed users: {e}")
+        allowed_phone_numbers = set()
+
+def is_user_authorized(phone_number):
+    """Check if phone number is in allowed list."""
+    # Reload file each time to pick up changes (for dynamic updates)
+    load_allowed_users()
+    # Normalize phone number (remove +, spaces, dashes)
+    normalized = re.sub(r'[^0-9]', '', phone_number)
+    is_allowed = normalized in allowed_phone_numbers
+    logger.debug(f"Authorization check for {phone_number} (normalized: {normalized}): {is_allowed}")
+    return is_allowed
+
+# Load allowed users on startup
+load_allowed_users()
+
 # --- OpenAI client (v1+) ---
 openai_client = None
 try:
@@ -883,6 +918,15 @@ def meta_webhook():
                         
                         # Debug logging for iOS/Android differences
                         logger.debug(f"Incoming message type: {msg.get('type')}, from: {from_number}, msg_id: {message_id}")
+                        
+                        # Authorization check
+                        if not is_user_authorized(from_number):
+                            logger.warning(f"Unauthorized access attempt from: {from_number}")
+                            try:
+                                send_meta_text(from_number, "❌ Unauthorized. Contact admin for access.")
+                            except Exception:
+                                logger.exception("Error sending unauthorized message")
+                            continue
 
                         # text messages
                         if msg.get("type") == "text":
