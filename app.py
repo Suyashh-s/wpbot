@@ -275,8 +275,10 @@ You are a Gen Z workplace coach chatbot. Your role is to guide young professiona
 • Always emphasize what is within their personal control.
 • Do not speculate about or comment on company policies, procedures, or cultural rules. If the user brings these up, steer back to what they can do in their role.
 • Keep your responses general but practical — useful without being overly specific to one-off scenarios.
-• Maintain a supportive, conversational, and Gen Z–friendly but professional tone. Don't asks same questions repeatedly or in round-about manner and dont ask too may questions.
-• Always make sure that te conversation stays within the Workplace Environment, If user goes Off-topic steer back the conversation on Track and if user doesn't agree make sure you just politely decline and say I'm not capable of providing solutions out of of Workplace Environment.
+• ALWAYS respond in a casual, friendly tone by default. Don't ask users if they want professional or casual tone - just be casual naturally.
+• EXCEPTION: When users ask for formal documents (like leave applications, emails to management, formal letters), respond in casual tone first saying "Hey, I don't have your company's policies, but here's a common professional template you can use:" then provide the professional format.
+• Don't ask same questions repeatedly or in round-about manner and dont ask too many questions.
+• Always make sure that the conversation stays within the Workplace Environment. If user goes off-topic, steer back the conversation on track and if user doesn't agree, politely decline and say I'm not capable of providing solutions outside of Workplace Environment.
 
 ⸻
 
@@ -475,15 +477,25 @@ except Exception as e:
     llm = None
     qa = None
 
+# --- Detailed RAG dependency logging ---
+if not llm:
+    logger.warning("RAG not enabled: llm (ChatOpenAI) is missing or failed to initialize.")
+if not db_retriever:
+    logger.warning("RAG not enabled: db_retriever (Qdrant retriever) is missing or failed to initialize.")
+if not create_history_aware_retriever:
+    logger.warning("RAG not enabled: create_history_aware_retriever is missing.")
+if not create_retrieval_chain:
+    logger.warning("RAG not enabled: create_retrieval_chain is missing.")
+if not create_stuff_documents_chain:
+    logger.warning("RAG not enabled: create_stuff_documents_chain is missing.")
+
 # Conversation memory and tone preferences
 conversation_memory = {}
 tone_preferences = {}  # maps user_id -> "professional" | "casual"
 
 def generate_reply_for_input(user_id: str, user_input: str) -> str:
-    tone = tone_preferences.get(user_id)
+    # No tone preference needed - AI automatically uses casual tone by default
     effective_input = user_input
-    if tone:
-        effective_input = f"[TONE: {tone}]\n{user_input}"
     chat_history_for_chain = conversation_memory.get(user_id, [])
     try:
         if qa:
@@ -941,7 +953,7 @@ def meta_webhook():
                                 (normalized_input.startswith("hey") and len(normalized_input) <= 7 and all(c in "hey!" for c in normalized_input))
                             )
                             if is_greeting:
-                                logger.info(f"Greeting detected: '{user_input}' -> sending tone choice buttons")
+                                logger.info(f"Greeting detected: '{user_input}' -> sending ❤️ reaction")
                                 try:
                                     if message_id:
                                         send_whatsapp_reaction(
@@ -949,13 +961,7 @@ def meta_webhook():
                                         )
                                 except Exception:
                                     logger.exception("Error sending reaction on greeting")
-                                try:
-                                    send_meta_interactive_tone_choice(from_number)
-                                    logger.info("Tone choice buttons sent successfully")
-                                except Exception:
-                                    logger.exception("Error sending interactive tone choice")
-                                # Skip AI response - buttons are enough for greeting
-                                continue
+                                # Let AI respond naturally in casual tone (no tone selection buttons)
 
                         # audio/voice handling (Meta)
                         elif msg.get("type") in ("audio", "voice"):
