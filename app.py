@@ -751,8 +751,11 @@ def send_whatsapp_reaction(to_number: str, message_id: str, emoji: str, phone_nu
     logger.debug("Sent reaction %s to %s for message %s", emoji, to_number, message_id)
 
 def should_react_with_heart(user_input: str) -> bool:
-    triggers = ["hi", "hello", "hey", "my name is"]
-    return any(trigger in user_input.lower() for trigger in triggers)
+    # Only react to greetings, not other messages
+    normalized = user_input.lower().strip().rstrip('!?.,;: ')
+    greetings = ["hi", "hii", "hiii", "hello", "helloo", "hey", "heyy", "heyyy", "sup", "yo"]
+    # Check if it's ONLY a greeting (not "hi, I need help with...")
+    return normalized in greetings or (len(normalized) <= 6 and normalized.startswith(("hi", "hey")))
 
 def send_meta_text(to_number: str, text: str):
     url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
@@ -1027,14 +1030,8 @@ def meta_webhook():
                             user_input = None
 
                         if user_input:
-                            try:
-                                if should_react_with_heart(user_input):
-                                    if message_id:
-                                        send_whatsapp_reaction(
-                                            from_number, message_id, "❤️", META_PHONE_NUMBER_ID, META_ACCESS_TOKEN
-                                        )
-                            except Exception:
-                                logger.exception("Error sending reaction for user_input")
+                            # Heart reactions only for greetings (already handled above in greeting detection)
+                            # Skip heart reaction here to avoid reacting to all messages
 
                             reply_text = generate_reply_for_input(from_number, user_input)
                             send_url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
