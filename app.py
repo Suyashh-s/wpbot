@@ -276,7 +276,8 @@ You are a Gen Z workplace coach chatbot. Your role is to guide young professiona
 • Do not speculate about or comment on company policies, procedures, or cultural rules. If the user brings these up, steer back to what they can do in their role.
 • Keep your responses general but practical — useful without being overly specific to one-off scenarios.
 • ALWAYS respond in a casual, friendly tone by default. Don't ask users if they want professional or casual tone - just be casual naturally.
-• EXCEPTION: When users ask for formal documents (like leave applications, emails to management, formal letters), respond in casual tone first saying "Hey, I don't have your company's policies, but here's a common professional template you can use:" then provide the professional format.
+• EXCEPTION A: When users ask for formal documents (like leave applications, emails to management, formal letters), respond in casual tone first saying "Hey, I don't have your company's policies, but here's a common professional template you can use:" then provide the professional format.
+• EXCEPTION B (Sensitive issues): If the topic involves harassment, discrimination, bullying, threats, or safety concerns at work, switch to a concise professional tone automatically and provide: (1) immediate safety-first guidance, (2) boundary-setting script, and (3) an HR report email template. Avoid speculation and keep it factual.
 • Don't ask same questions repeatedly or in round-about manner and dont ask too many questions.
 • Always make sure that the conversation stays within the Workplace Environment. If user goes off-topic, steer back the conversation on track and if user doesn't agree, politely decline and say I'm not capable of providing solutions outside of Workplace Environment.
 
@@ -781,6 +782,30 @@ def workplace_boundary_message() -> str:
         " tell me how — otherwise I can’t discuss gossip or non‑work topics."
     )
 
+def is_sensitive_workplace_issue(text: str) -> bool:
+    t = (text or "").lower()
+    keywords = [
+        "harass", "harassment", "flirt", "flirting", "inappropriate", "unwanted",
+        "sexual", "bully", "bullying", "abuse", "abusive", "threat", "threaten",
+        "stalk", "stalking", "discriminate", "discrimination", "assault"
+    ]
+    return any(k in t for k in keywords)
+
+def sensitive_guidance_message() -> str:
+    return (
+        "I’m switching to a more formal guide since this involves workplace safety and conduct.\n\n"
+        "1) Safety first: If you ever feel unsafe, step away and contact a trusted senior/HR immediately.\n"
+        "2) Document facts: date/time, what was said/done, location, witnesses, any messages.\n"
+        "3) Boundary script (DM or in person): ‘I want to be clear — that made me uncomfortable. \n"
+        "Please keep our interactions professional and work‑related.’\n\n"
+        "4) HR email template:\nSubject: Concern about inappropriate conduct\n"
+        "Hi [HR/Manager Name],\nI’m writing to document an incident that made me uncomfortable at work.\n"
+        "On [date/time] at [place], [name/role] [brief factual description].\n"
+        "This affects my ability to work comfortably. I’m requesting guidance on next steps.\n"
+        "I’ve attached any relevant evidence.\nThanks,\n[Your Name]\n\n"
+        "If you want, I can help refine the boundary message or the email draft." 
+    )
+
 def send_meta_text(to_number: str, text: str):
     url = f"https://graph.facebook.com/v17.0/{META_PHONE_NUMBER_ID}/messages"
     payload = {"messaging_product": "whatsapp", "to": to_number, "text": {"body": text}}
@@ -999,6 +1024,13 @@ def meta_webhook():
                                         send_meta_text(from_number, workplace_boundary_message())
                                     except Exception:
                                         logger.exception("Error sending boundary message")
+                                    continue
+                                # Auto-switch to professional mode for sensitive issues
+                                if is_sensitive_workplace_issue(user_input):
+                                    try:
+                                        send_meta_text(from_number, sensitive_guidance_message())
+                                    except Exception:
+                                        logger.exception("Error sending sensitive guidance")
                                     continue
 
                         # audio/voice handling (Meta)
