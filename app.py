@@ -49,6 +49,13 @@ logger.info("TWILIO_AUTH_TOKEN length: %s", len(TWILIO_AUTH_TOKEN or ""))
 # --- Phone Number Authorization ---
 ALLOWED_USERS_FILE = "allowed_users.txt"
 allowed_phone_numbers = set()
+unauthorized_notified = set()
+
+def normalize_phone(phone_number: str) -> str:
+    try:
+        return re.sub(r"[^0-9]", "", phone_number or "")
+    except Exception:
+        return str(phone_number or "")
 
 def load_allowed_users():
     """Load allowed phone numbers from file."""
@@ -986,13 +993,18 @@ def meta_webhook():
                         # Debug logging for iOS/Android differences
                         logger.debug(f"Incoming message type: {msg.get('type')}, from: {from_number}, msg_id: {message_id}")
                         
-                        # Authorization check
+                        # Authorization check (notify once per unauthorized number)
                         if not is_user_authorized(from_number):
-                            logger.warning(f"Unauthorized access attempt from: {from_number}")
-                            try:
-                                send_meta_text(from_number, "❌ Unauthorized. Contact admin for access.")
-                            except Exception:
-                                logger.exception("Error sending unauthorized message")
+                            norm = normalize_phone(from_number)
+                            if norm not in unauthorized_notified:
+                                logger.warning(f"Unauthorized access attempt from: {from_number} (first notice)")
+                                try:
+                                    send_meta_text(from_number, "❌ Unauthorized. Contact admin for access.")
+                                except Exception:
+                                    logger.exception("Error sending unauthorized message")
+                                unauthorized_notified.add(norm)
+                            else:
+                                logger.info(f"Suppressing repeat unauthorized notice for: {from_number}")
                             continue
 
                         # text messages
